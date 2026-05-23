@@ -1,0 +1,21 @@
+# Data License & Attribution
+
+**Dataset:** ECG + PPG Features for MI Classification
+**File:** combined_cardiac_dataset.csv
+**Author:** Meruva Kodanda Suraj (Kaggle username: meruvakodandasuraj)
+**Source:** https://www.kaggle.com/datasets/meruvakodandasuraj/ecg-ppg-features-for-mi-classification
+**License:** CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/)
+
+This dataset is redistributed under the terms of the Creative Commons
+Attribution-ShareAlike 4.0 International license. No modifications have been
+made to the source data.
+
+## Citation
+
+@dataset{meruvakodandasuraj_ecg_ppg_mi_2026,
+  title     = {ECG + PPG Features for MI Classification},
+  author    = {Meruva Kodanda Suraj},
+  year      = {2026},
+  publisher = {Kaggle},
+  url       = {https://www.kaggle.com/datasets/meruvakodandasuraj/ecg-ppg-features-for-mi-classification}
+}
