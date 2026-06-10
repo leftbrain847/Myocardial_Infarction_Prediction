@@ -1,0 +1,490 @@
+---
+title: "Predicting Myocardial Infarction from Cardiac Features: A Multi-Modal Ablation Study"
+author: "Jim Titus"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 6,
+  fig.height = 3.2
+)
+```
+
+# Overview
+
+This project began with the HEART score, a clinical tool that stratifies a chest-pain
+patient's risk of a major cardiac event from five inputs (History, ECG findings, Age,
+Risk factors, and Troponin). Historically, emergency departments struggled with intake
+decisions for patients presenting with chest pain. Bed and clinician capacity are fixed
+constraints, yet sending these patients home risks denying care for acute cardiac incidents.
+The HEART score's grouping of predictors into a small set of clinically meaningful 
+buckets is what shaped both the dataset choice and the modeling approach for this study.
+
+This dataset's feature coverage aligns well with the HEART inputs. It carries rich ECG findings
+and age alongside the standard cardiac risk factors, even though it lacks a troponin
+biomarker and a structured patient history. The coverage is good but deliberately imperfect,
+which makes the question of what is predictable without troponin a real one. It also
+has little prior exposure on Kaggle, which fits the project requirement to avoid well-known
+or heavily reused data. Perhaps most importantly, it has 5,000 patient records across roughly
+40 candidate predictors. That's more rows and features than many comparable cardiac
+datasets, which gives the models ample data to train and test on.
+
+The outcome is a binary `mi_label`, indicating whether the patient had a myocardial
+infarction (MI, a heart attack). It is present in about 18.5% of patients. The
+predictors fall into three natural HEART-style groups: standard demographic and
+clinical risk factors, electrocardiogram (ECG) waveform features, and
+photoplethysmogram (PPG) features (the kind a wrist or fingertip wearable can capture).
+A fourth bucket of measurement-quality metadata was excluded, as it describes the 
+recording rather than the patient.
+
+A first model using the HEART-aligned features classified MI almost perfectly, around
+99.9% accuracy. That accuracy comes from the data more than the model. The ECG
+features encode the diagnostic markers of MI directly. ST-segment elevation,
+T-wave changes, and pathological Q-waves are the classic criteria a cardiologist uses,
+and a synthetic data generator encodes them more cleanly than real physiology ever
+would. A clean ECG makes MI detection trivial here.
+
+That near-perfect accuracy is what prompted the actual investigation. Rather than report
+an uninteresting 99.9%, I re-bucketed the predictors and began removing features to see
+how much accuracy I could retain without the diagnostic ECG channel. This is an ablation
+study. So the core question quickly became how well the non-diagnostic, wearable-grade
+PPG features + basic demographics could predict MI on their own.
+
+The key steps performed were to clean and structure the data, assign every predictor to
+a clinical bucket (demographics, ECG, PPG, or measurement-quality metadata),
+explore the data to locate where the class separation lives, define a small family of
+models by which buckets each is allowed to see, and train two algorithms (logistic
+regression and a random forest) on each feature set. Model comparison leans on metrics
+that stay honest under class imbalance rather than on accuracy alone.
+
+# Methods and analysis
+
+## Data ingestion
+
+The data (see references for Kaggle citation) can be downloaded automatically from my 
+public GitHub repository, so the analysis is fully reproducible with no manual 
+download or login. The raw file has 50 columns and 5,000 rows.
+
+```{r packages}
+# Auto-install any missing packages, then load.
+if (!require(caret, quietly = TRUE))        
+  { install.packages("caret"); library(caret) }
+if (!require(randomForest, quietly = TRUE)) 
+  { install.packages("randomForest"); library(randomForest) }
+if (!require(ggplot2, quietly = TRUE))      
+  { install.packages("ggplot2"); library(ggplot2) }
+```
+
+```{r ingestion}
+# Download once (relative path); reuse the local copy on re-runs.
+data_url   <- paste0("https://raw.githubusercontent.com/leftbrain847/",
+      "Myocardial_Infarction_Prediction/main/Data/combined_cardiac_dataset.csv")
+local_copy <- "combined_cardiac_dataset.csv"
+if (!file.exists(local_copy)) download.file(data_url, local_copy, mode = "wb")
+cardiac <- read.csv(local_copy, stringsAsFactors = FALSE)
+
+dim(cardiac)
+```
+
+## Data cleaning and target preparation
+
+Two columns are removed before modeling. `patient_id` is a pure identifier with no
+predictive content, and `mi_subtype` is an alternate, more granular version of the
+target (it labels MI cases as STEMI, NSTEMI, or Old_MI). Leaving `mi_subtype` in
+would leak the outcome directly, so I dropped it. The binary target `mi_label` is
+converted to a labeled factor (`"No"`/`"Yes"`) so that `caret`'s classification
+metrics report sensitivity and specificity against the clinically meaningful
+positive class. Remaining text columns (for example `sex` and `smoking_status`)
+are converted to factors. The dataset has no missing values, so no imputation is
+required.
+
+```{r cleaning}
+# Drop the identifier and the leak-prone alternate target.
+df <- cardiac[, !(names(cardiac) %in% c("patient_id", "mi_subtype"))]
+
+# Target -> factor with "Yes" as the positive class.
+df$mi_label <- factor(ifelse(df$mi_label == 1, "Yes", "No"), levels = c("No", "Yes"))
+
+# Encode character categoricals as factors.
+chr_cols <- names(df)[sapply(df, is.character)]
+df[chr_cols] <- lapply(df[chr_cols], factor)
+
+# Confirm there is nothing to impute.
+cat("Total missing values:", sum(is.na(df)), "\n")
+cat("MI prevalence:", round(mean(df$mi_label == "Yes"), 4), "\n")
+```
+
+## Feature bucketing: the core design choice
+
+Every predictor is assigned to exactly one of four clinical buckets. Models are
+then defined by choosing which buckets they are allowed to look at.
+This makes the ablation transparent and easy to extend.
+
+The buckets are:
+
+- **Demographics** age, sex, BMI, smoking status, diabetes, hypertension,
+  cholesterol, family history.
+- **ECG** the electrocardiogram morphology features, including the diagnostic
+  ST/T/Q-wave measurements, plus heart-rate-variability (HRV) metrics, which are
+  ECG-derived.
+- **PPG** the photoplethysmogram features a wearable optical sensor produces
+  (oxygen saturation, pulse transit time, pulse-wave velocity, perfusion, waveform
+  shape).
+- **Signal quality** measurement-quality metadata (noise level, recording lead,
+  motion artifact). This describes the recording rather than the patient, so
+  letting it predict MI would be an artifact. It is excluded from every model.
+
+Two bucketing decisions are worth flagging because they make the central
+comparison harder rather than easier, and therefore more honest. First, the HRV
+metrics are placed in the ECG bucket because they are computed from the ECG R-R
+intervals. Second, `pulse_rate_bpm` and `peak_to_peak_interval_ms` are measured by
+the PPG sensor but carry the same cardiac-cycle (heart-rate) information as the ECG,
+with which they are highly collinear. I assigned them to ECG. This deliberately
+handicaps the PPG-only model by denying it heart-rate access, so any performance it
+retains comes from genuinely PPG-specific information rather than a back-door copy
+of heart rate.
+
+```{r buckets}
+buckets <- list(
+  demographics = c("age", "sex", "bmi", "smoking_status", "diabetes",
+                   "hypertension", "total_cholesterol_mg_dl", "family_history_cad"),
+
+  ecg = c("heart_rate_bpm", "rr_interval_ms", "pr_interval_ms", "qrs_duration_ms",
+          "qt_interval_ms", "qtc_bazett_ms", "st_elevation_mv", "st_depression_mv",
+          "st_slope", "t_wave_amplitude_mv", "t_wave_inversion", "pathological_q_wave",
+          "p_wave_duration_ms", "p_wave_amplitude_mv",
+          # HRV is ECG-derived:
+          "hrv_sdnn_ms", "hrv_rmssd_ms", "hrv_lf_power_ms2", "hrv_hf_power_ms2",
+          "hrv_lf_hf_ratio"),
+
+  ppg = c("spo2_percent", "pulse_transit_time_ms", "augmentation_index_pct",
+          "stiffness_index_m_s", "reflection_index_pct", "systolic_peak_amplitude",
+          "diastolic_peak_amplitude", "pulse_wave_velocity_m_s", "perfusion_index_pct",
+          "systolic_upstroke_time_ms", "diastolic_time_ms", "crest_time_ratio"),
+
+  signal_quality = c("signal_quality_score", "noise_level_db", "recording_lead",
+                     "ppg_signal_quality", "motion_artifact_score", "measurement_site")
+)
+
+# pulse_rate_bpm and peak_to_peak_interval_ms are PPG-measured but heart-rate-
+# equivalent and collinear with ECG heart rate, so they go to ECG (a deliberate
+# handicap on the PPG-only model, explained above).
+buckets$ecg <- c(buckets$ecg, "pulse_rate_bpm", "peak_to_peak_interval_ms")
+
+# Integrity check. Every predictor must land in exactly one bucket, none missing
+# and none duplicated. If this fails the analysis stops rather than silently
+# dropping or double-counting a feature.
+all_bucketed <- unlist(buckets, use.names = FALSE)
+all_preds    <- setdiff(names(df), "mi_label")
+stopifnot(setequal(all_bucketed, all_preds))
+stopifnot(!any(duplicated(all_bucketed)))
+
+sapply(buckets, length)
+```
+
+## Exploratory data analysis
+
+The first thing to establish is the class balance, because it dictates which
+metrics are trustworthy later. MI is present in about 18.5% of patients, so a model
+that does nothing but predict "No" for everyone would already be about 81.5%
+accurate. Accuracy alone is therefore close to meaningless here. The analysis must
+lean on sensitivity (the share of true MIs caught), specificity, balanced accuracy,
+and area under the ROC curve (AUC).
+
+```{r eda-balance, fig.cap="Class balance. MI is the minority class at about 18.5 percent, so accuracy must be read against a no-information rate of roughly 0.815."}
+ggplot(df, aes(mi_label, fill = mi_label)) +
+  geom_bar(colour = "black") +
+  scale_fill_manual(values = c("No" = "lightsteelblue", "Yes" = "indianred")) +
+  labs(title = "Class balance of MI label", x = "MI", y = "Patients") +
+  theme_classic() +
+  theme(legend.position = "none")
+```
+
+The ECG diagnostic features separate MI from non-MI almost completely, and ST-segment
+elevation shows it most clearly. The two distributions barely overlap. That's not
+a leak or a modeling artifact. The synthetic generator built the textbook ECG criteria
+for MI straight into these columns, so the clean split is a property of the data itself. 
+Seeing this plot makes the later 99.9% accuracy unsurprising rather than suspicious.
+
+```{r eda-ecg, fig.cap="ST elevation by MI label. The near-separation of these distributions is why any model with ECG access classifies MI almost perfectly. This is a feature of the synthetic data, not leakage."}
+ggplot(df, aes(st_elevation_mv, fill = mi_label)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("No" = "lightsteelblue", "Yes" = "indianred")) +
+  labs(title = "ST elevation by MI label (ECG feature)",
+       x = "ST elevation (mV)", y = "Density", fill = "MI") +
+  theme_classic()
+```
+
+The PPG features carry real but weaker separation. Pulse-wave velocity, a marker of
+arterial stiffness an optical sensor can estimate, shifts clearly higher in MI
+patients. The overlap is larger than for ST elevation, so PPG alone should predict
+well but not perfectly. This previews the central finding, that the wearable channel
+recovers a great deal of the predictive power even without the diagnostic ECG.
+
+```{r eda-ppg, fig.cap="Pulse-wave velocity by MI label. The PPG channel separates the classes meaningfully but with more overlap than ECG, previewing strong-but-imperfect PPG-only performance."}
+ggplot(df, aes(pulse_wave_velocity_m_s, fill = mi_label)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("No" = "lightsteelblue", "Yes" = "indianred")) +
+  labs(title = "Pulse wave velocity by MI label (PPG feature)",
+       x = "PWV (m/s)", y = "Density", fill = "MI") +
+  theme_classic()
+```
+
+Demographics separate the classes weakly. Age trends higher in MI patients, as expected
+clinically, but the distributions overlap heavily. A demographics-only model should
+struggle, and the contrast between its weakness and the PPG channel's strength is
+what the ablation is designed to expose.
+
+```{r eda-demo, fig.cap="Age by MI label. Demographic risk factors shift in the expected direction but overlap heavily, foreshadowing weak demographics-only performance."}
+ggplot(df, aes(age, fill = mi_label)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("No" = "lightsteelblue", "Yes" = "indianred")) +
+  labs(title = "Age by MI label (demographic feature)",
+       x = "Age", y = "Density", fill = "MI") +
+  theme_classic()
+```
+
+## Train/test split
+
+The data is split into 80% training and 20% test, stratified on the outcome so
+both partitions preserve the roughly 18.5% MI prevalence. The split ratio is
+deliberate. With 5,000 rows, a 20% test set holds about 1,000 patients and roughly
+185 MI cases. That's enough that minority-class metrics like sensitivity are estimated
+stably and do not swing on a handful of cases. Simultaneously, 4,000 rows for training
+gives the random forest ample data to fit. A more aggressive split such as 50/50 would
+needlessly starve the models of training data and the extra test precision it buys
+isn't worth that cost. A very lean test set such as 90/10 would leave only about 
+90 MI cases and make sensitivity noisy. 80/20 balances those concerns.
+
+Note that in `caret::createDataPartition`, the argument `p` sets the proportion of
+data placed in the returned index. That index becomes the test set here, so
+`p = 0.2` produces a 20% test set. The split seed uses `sample.kind = "Rounding"`
+so the partition is reproducible across R versions.
+
+```{r split}
+set.seed(1, sample.kind = "Rounding")
+test_index <- createDataPartition(df$mi_label, times = 1, p = 0.2, list = FALSE)
+train <- df[-test_index, ]
+test  <- df[test_index, ]
+
+# Align factor levels in test to those learned on train, so prediction never
+# meets an unseen category. With a stratified split on 5,000 rows this is a
+# safeguard rather than an expected event. The stopifnot confirms no NA results.
+for (c in chr_cols) test[[c]] <- factor(test[[c]], levels = levels(train[[c]]))
+stopifnot(!any(is.na(test)))
+
+cat("train rows:", nrow(train), " test rows:", nrow(test), "\n")
+cat("train MI prevalence:", round(mean(train$mi_label == "Yes"), 4),
+    " test MI prevalence:", round(mean(test$mi_label == "Yes"), 4), "\n")
+```
+
+## Modeling approach
+
+Two algorithms are trained on each feature set. The first is logistic regression,
+an interpretable linear baseline appropriate for binary classification. The second
+is a random forest, an ensemble of decision trees that serves as the more advanced
+model required by the project. It captures non-linearities and feature interactions
+without manual specification and stays stable on the perfectly-separable predictors
+that make plain logistic regression numerically unreliable here.
+
+The two models are trained on identical data under identical random seeds for every
+feature set. Any difference in performance is therefore attributable to the model
+or the features. Logistic regression is fit through caret with five-fold cross-validation
+on the training set. The random forest uses its own out-of-bag estimate internally. 
+All reported numbers come from the held-out test set, which is never used in training
+or model selection.
+
+Performance is summarized with the metrics that survive class imbalance. Accuracy
+is reported but read against the no-information rate. Sensitivity is the headline
+clinical metric, because missing a real heart attack (a false negative) is far
+costlier than a false alarm. Specificity, balanced accuracy, Cohen's kappa, and AUC
+round out the picture. AUC matters most because it is threshold-independent and
+exposes models that look acceptable on accuracy only because they default to the
+majority class.
+
+```{r model-helpers}
+# Build a feature set from a chosen set of buckets.
+build_feature_set <- function(bucket_names) {
+  unlist(buckets[bucket_names], use.names = FALSE)
+}
+
+# Five-fold CV on the training set, with class probabilities for AUC scoring.
+control <- trainControl(method = "cv", number = 5,
+                        classProbs = TRUE, summaryFunction = twoClassSummary)
+
+# AUC via the Mann-Whitney U relationship (no extra package dependency).
+auc_score <- function(prob, truth) {
+  r  <- rank(prob)
+  n1 <- sum(truth == "Yes")
+  n0 <- sum(truth == "No")
+  (sum(r[truth == "Yes"]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+# Train both models on a feature set, evaluate on test, return one tidy row each.
+run_models <- function(feature_cols, set_label) {
+  tr <- train[, c(feature_cols, "mi_label")]
+  te <- test[,  c(feature_cols, "mi_label")]
+
+  set.seed(1)
+  glm_fit  <- train(mi_label ~ ., data = tr, method = "glm",
+                    family = "binomial", trControl = control, metric = "ROC")
+  glm_pred <- predict(glm_fit, te)
+  glm_prob <- predict(glm_fit, te, type = "prob")[, "Yes"]
+  glm_cm   <- confusionMatrix(glm_pred, te$mi_label, positive = "Yes")
+
+  set.seed(1)
+  rf_fit   <- randomForest(mi_label ~ ., data = tr)
+  rf_pred  <- predict(rf_fit, te)
+  rf_prob  <- predict(rf_fit, te, type = "prob")[, "Yes"]
+  rf_cm    <- confusionMatrix(rf_pred, te$mi_label, positive = "Yes")
+
+  grab <- function(cm, prob, model) {
+    data.frame(
+      feature_set = set_label,
+      model       = model,
+      n_features  = length(feature_cols),
+      accuracy    = unname(cm$overall["Accuracy"]),
+      sensitivity = unname(cm$byClass["Sensitivity"]),
+      specificity = unname(cm$byClass["Specificity"]),
+      balanced    = unname(cm$byClass["Balanced Accuracy"]),
+      kappa       = unname(cm$overall["Kappa"]),
+      AUC         = auc_score(prob, te$mi_label),
+      row.names   = NULL
+    )
+  }
+  rbind(grab(glm_cm, glm_prob, "logistic"),
+        grab(rf_cm,  rf_prob,  "randomForest"))
+}
+```
+
+On feature sets that include ECG, the classes are so nearly separable that logistic 
+regression returns fitted probabilities of effectively 0 or 1, triggering R's "fitted 
+probabilities numerically 0 or 1 occurred" warning. That warning marks perfect 
+separation rather than a failure, and it shows how cleanly the ECG features encode 
+the outcome. The random forest does not hit this problem, which counts in its favor 
+on this data.
+
+## The ablation
+
+Four feature sets are compared, each defined purely by which buckets it may see:
+
+1. Full (ECG + PPG + Demographics), everything except measurement metadata.
+2. ECG only, the diagnostic channel in isolation.
+3. PPG + Demographics, the central research question. This is wearable-grade
+   measurement plus basic risk factors, with the diagnostic ECG removed.
+4. Demographics only, risk factors with no recorded cardiac measurement at all, as
+   a weak-baseline floor.
+
+```{r ablation}
+# No-information rate on the test set. This is the accuracy of always predicting
+# the majority class, and every model's accuracy should be read against it.
+NIR <- max(prop.table(table(test$mi_label)))
+cat("Test-set no-information rate:", round(NIR, 4), "\n")
+
+model_sets <- list(
+  "Full (ECG+PPG+Demo)" = c("ecg", "ppg", "demographics"),
+  "ECG only"            = c("ecg"),
+  "PPG + Demographics"  = c("ppg", "demographics"),
+  "Demographics only"   = c("demographics")
+)
+
+results <- do.call(rbind, lapply(names(model_sets), function(label) {
+  run_models(build_feature_set(model_sets[[label]]), label)
+}))
+```
+
+# Results
+
+```{r results-table}
+knitr::kable(results, digits = 4,
+             caption = "Ablation results on the held-out test set. Accuracy is 
+             read against a no-information rate of 0.815, and sensitivity is 
+             the share of true MIs caught.")
+```
+
+The progression tells a clear four-tier story.
+
+The full model and the ECG-only model are both near-perfect, with accuracy and AUC
+at their ceilings and sensitivity around 99%. Adding PPG and demographics on top of
+ECG changes almost nothing, because the ECG channel already contains nearly all the
+recoverable information. This confirms the framing from the overview. In this dataset,
+detecting MI from a clean ECG is not the challenge. Reporting that number alone wouldn't
+demonstrate much.
+
+The PPG + Demographics model is the core result. With the diagnostic ECG
+entirely removed and even heart rate withheld, it still reaches about 97 to 98%
+accuracy, catches roughly 91% of true MIs, and achieves an AUC near 0.99. The
+wearable-grade optical measurements, combined with basic risk factors, recover the
+large majority of the discriminative power of a full clinical ECG. That is the
+useful finding, and it suggests that in this synthetic setting, non-diagnostic
+sensing carries far more MI information than one might expect.
+
+The demographics-only model exposes why accuracy cannot be trusted on its own. It
+posts about 81% accuracy, which sounds respectable until it is compared to the
+no-information rate of 0.815. The model sits at that floor. It reaches its accuracy
+by predicting "No" for almost everyone, catching only about 5 to 10% of actual MIs.
+Its kappa is near zero and its AUC, about 0.70 to 0.74, is far below the other
+models. This is a powerful illustration of the accuracy paradox under class
+imbalance. It is the clearest justification for reporting sensitivity and AUC
+throughout rather than accuracy alone.
+
+Comparing the two algorithms, the random forest and logistic regression perform
+almost identically on the strong feature sets. The random forest is slightly ahead
+on sensitivity and balanced accuracy on the harder PPG + Demographics set, and it
+avoids the numerical-separation warnings that affect logistic regression on the ECG
+sets.
+
+# Conclusion
+
+This project started from the HEART score and the idea of grouping cardiac
+predictors into clinical buckets. A first model built on the HEART-aligned features
+predicted MI almost perfectly, around 99.9% accuracy, which prompted the real
+investigation. The question was how much of that accuracy survives once the
+diagnostic ECG channel is removed. To answer it, I re-bucketed the predictors and ran
+an ablation, training logistic regression and a random forest on feature sets defined
+by clinical buckets and comparing them on metrics chosen to stay honest under class imbalance.
+
+The central finding is that the photoplethysmogram channel, the kind of measurement
+a consumer wearable can capture, combined with basic demographics recovers most 
+of the MI predictive power (around 91% sensitivity and AUC near 0.99) even with
+the diagnostic ECG and heart rate deliberately withheld. The demographics-only
+model, by contrast, performs no better than guessing the majority class, which
+doubles as a concrete demonstration of why accuracy is the wrong headline metric
+here.
+
+Taken at face value, the potential impact points toward the promise of low-cost
+wearable sensing for cardiac risk screening. That reading must be heavily qualified,
+which leads to the limitations. Most important, the data is synthetic. A generator
+that writes the textbook ECG criteria for MI directly into the ST/T/Q-wave columns
+produces cleaner separation than real physiology would, so the near-perfect ECG
+performance and the strong PPG performance are both optimistic relative to clinical 
+reality. The dataset also lacks the cardiac troponin blood test, along with the structured
+clinical context that scoring systems like the HEART score combine. Finally, the
+ablation treats buckets as clean modalities, but real ECG and PPG measurements share
+underlying physiology, so the separation between channels is cleaner in this design
+than it would be in practice.
+
+The natural future work is to repeat this ablation on a real, non-synthetic cohort
+with troponin and outcome follow-up, to add probability-threshold tuning and
+cost-sensitive learning so the sensitivity and specificity trade-off can be set to a
+clinically appropriate operating point, and to test additional algorithms such as
+gradient boosting. The bucketing framework built here, defining models by
+transparent feature groups and comparing them on imbalance-aware metrics, transfers
+directly to that more demanding setting.
+
+# References
+
+Suraj, M. K. *ECG + PPG Features for MI Classification* (synthetic dataset,
+CC BY-SA 4.0). Kaggle.
+
+Irizarry, R. A. *Introduction to Data Science: Data Analysis and Prediction
+Algorithms with R.* https://rafalab.dfci.harvard.edu/dsbook/
